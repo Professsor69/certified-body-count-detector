@@ -1,11 +1,9 @@
 import type { ScanResult } from "@/lib/resultGenerator";
 
 /**
- * Workaround for html2canvas not supporting oklch/oklab (Tailwind v4).
- * We create an offscreen canvas manually using the DOM element's bounding box
- * and render the card content using a simple canvas-based approach.
- * 
- * For full fidelity, we patch unsupported colors before rendering.
+ * Download the result card as a PNG image.
+ * Works around html2canvas's lack of oklch/oklab support (Tailwind v4)
+ * by rendering the card content onto a custom canvas instead.
  */
 export async function downloadResultCard(
   result: ScanResult,
@@ -13,55 +11,62 @@ export async function downloadResultCard(
 ): Promise<void> {
   if (typeof window === "undefined") return;
 
+  const element = document.getElementById(elementId);
+  if (!element) return;
+
   try {
-    const html2canvas = (await import("html2canvas")).default;
-    const element = document.getElementById(elementId);
-    if (!element) return;
-
-    // Temporarily patch oklch/oklab colors to hex equivalents on all elements
-    const allElements = element.querySelectorAll<HTMLElement>("*");
-    const originalStyles: Array<{
-      el: HTMLElement;
-      bg: string;
-      color: string;
-      border: string;
-      boxShadow: string;
-    }> = [];
-
-    const patchColor = (color: string): string => {
-      // Replace oklch/oklab with safe fallbacks
-      if (!color || (!color.includes("oklch") && !color.includes("oklab"))) {
-        return color;
+    // Temporarily force all computed colors to safe hex values
+    // by injecting a style override that replaces oklab/oklch
+    const style = document.createElement("style");
+    style.id = "__download-patch__";
+    style.textContent = `
+      #result-card, #result-card * {
+        --tw-bg-opacity: 1 !important;
+        color: inherit !important;
       }
-      // Map common Tailwind v4 oklch values to hex approximations
-      if (color.includes("oklch(0.145")) return "#030712"; // bg-dark
-      if (color.includes("oklch(1 0 0)")) return "#ffffff"; // white
-      if (color.includes("oklch(0 0 0)")) return "#000000"; // black
-      return "transparent";
-    };
+    `;
+    document.head.appendChild(style);
 
-    allElements.forEach((el) => {
-      const cs = getComputedStyle(el);
-      const bg = cs.backgroundColor;
-      const color = cs.color;
-      const border = cs.borderColor;
-      const boxShadow = cs.boxShadow;
+    // Walk every element and replace any oklch/oklab background/color
+    // with their computed fallback
+    const allEls = element.querySelectorAll<HTMLElement>("*");
+    const overrides: Array<{ el: HTMLElement; props: Record<string, string> }> = [];
 
-      const patchedBg = patchColor(bg);
-      const patchedColor = patchColor(color);
-      const patchedBorder = patchColor(border);
+    allEls.forEach((el) => {
+      const cs = window.getComputedStyle(el);
+      const propsToCheck = [
+        "backgroundColor",
+        "color",
+        "borderTopColor",
+        "borderRightColor",
+        "borderBottomColor",
+        "borderLeftColor",
+        "outlineColor",
+        "boxShadow",
+      ] as const;
 
-      if (
-        patchedBg !== bg ||
-        patchedColor !== color ||
-        patchedBorder !== border
-      ) {
-        originalStyles.push({ el, bg, color, border, boxShadow });
-        if (patchedBg !== bg) el.style.backgroundColor = patchedBg;
-        if (patchedColor !== color) el.style.color = patchedColor;
-        if (patchedBorder !== border) el.style.borderColor = patchedBorder;
+      const patch: Record<string, string> = {};
+      let needsPatch = false;
+
+      propsToCheck.forEach((prop) => {
+        const val = cs[prop];
+        if (val && (val.includes("oklch") || val.includes("oklab"))) {
+          patch[prop] = "transparent";
+          needsPatch = true;
+        }
+      });
+
+      if (needsPatch) {
+        const saved: Record<string, string> = {};
+        Object.keys(patch).forEach((prop) => {
+          saved[prop] = (el.style as any)[prop];
+          (el.style as any)[prop] = patch[prop];
+        });
+        overrides.push({ el, props: saved });
       }
     });
+
+    const html2canvas = (await import("html2canvas")).default;
 
     const canvas = await html2canvas(element, {
       backgroundColor: "#030712",
@@ -69,38 +74,55 @@ export async function downloadResultCard(
       useCORS: true,
       allowTaint: true,
       logging: false,
-      ignoreElements: (el) => el.id === "share-buttons",
+      ignoreElements: (el) =>
+        el.id === "share-buttons" || el.tagName === "VIDEO",
+      onclone: (doc) => {
+        // In cloned doc, forcibly replace any oklch colors on all elements
+        doc.querySelectorAll<HTMLElement>("*").forEach((el) => {
+          const style = el.getAttribute("style") || "";
+          if (style.includes("oklch") || style.includes("oklab")) {
+            el.setAttribute(
+              "style",
+              style
+                .replace(/oklch\([^)]+\)/g, "transparent")
+                .replace(/oklab\([^)]+\)/g, "transparent")
+            );
+          }
+        });
+      },
     });
 
-    // Restore original styles
-    originalStyles.forEach(({ el, bg, color, border }) => {
-      el.style.backgroundColor = "";
-      el.style.color = "";
-      el.style.borderColor = "";
+    // Restore overridden styles
+    overrides.forEach(({ el, props }) => {
+      Object.keys(props).forEach((prop) => {
+        (el.style as any)[prop] = props[prop];
+      });
     });
+
+    // Remove style patch
+    document.getElementById("__download-patch__")?.remove();
 
     // Add watermark
     const ctx = canvas.getContext("2d");
     if (ctx) {
-      ctx.font = "bold 20px monospace";
-      ctx.fillStyle = "rgba(0, 255, 136, 0.35)";
+      ctx.font = "bold 22px monospace";
+      ctx.fillStyle = "rgba(0, 255, 136, 0.4)";
       ctx.textAlign = "right";
       ctx.fillText(
-        "✦ CertifiedDetector.fun",
+        "✦ CertifiedBodyCountDetector",
         canvas.width - 24,
         canvas.height - 24
       );
     }
 
     const link = document.createElement("a");
-    link.download = `certified-detector-${Date.now()}.png`;
+    link.download = `body-count-${result.bodyCount}-${Date.now()}.png`;
     link.href = canvas.toDataURL("image/png");
     link.click();
   } catch (err) {
     console.error("Download failed:", err);
-    // Fallback: show a browser print dialog
     alert(
-      "Screenshot download failed. Try right-clicking the result card and selecting 'Save image as'."
+      "Screenshot download failed. Try right-clicking the card and saving the image manually."
     );
   }
 }
